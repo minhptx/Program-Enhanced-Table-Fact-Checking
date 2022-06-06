@@ -1,0 +1,1 @@
+python program_selection/run_BERT_margin_loss.py --do_gen --load_dir ckpt_margin --data_dir preprocessed_data_program --do_train

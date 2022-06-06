@@ -20,6 +20,7 @@ import random
 import sys
 import io
 import json
+from datasets import Dataset
 import numpy as np
 import torch
 import time
@@ -38,18 +39,19 @@ import torch.nn.functional
 from transformers.file_utils import PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
 from modeling import BertForSequenceClassification, BertConfig
 from transformers import BertTokenizer, AdamW
-
-from torch.utils.tensorboard import SummaryWriter
 from collections import OrderedDict
+from torch.utils.tensorboard import SummaryWriter
+from accelerate import Accelerator
 
-logger = logging.getLogger(__name__)
+
 
 entity_linking_pattern = re.compile('#.*?;-*[0-9]+,(-*[0-9]+)#')  # match #a,b;-1,-1# and replace it with ENTITY
 fact_pattern = re.compile('#(.*?);-*[0-9]+,-*[0-9]+#')
 unk_pattern = re.compile('#([^#]+);-1,-1#')
 TSV_DELIM = "\t"
 TBL_DELIM = " ; "
-
+accelerator = Accelerator()
+logger = logging.getLogger(__name__)
 
 def parse_fact(fact):
     fact = re.sub(unk_pattern, '[UNK]', fact)  # optional
@@ -102,7 +104,6 @@ class LpaProcessor(object):
         with open(input_file, "r", encoding="utf-8") as f:
             lines = []
             for idx, line in enumerate(f):
-                print(line)
                 entry = line.strip().split('\t')
                 index = int(entry[1].split('-')[-1])
                 table_name = entry[0]
@@ -140,7 +141,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     label_map = {label: i for i, label in enumerate(label_list)}
     features = []
 
-    for (ex_index, combined_example) in enumerate(tqdm(examples, desc="convert to features")):
+    for (ex_index, combined_example) in enumerate(tqdm(examples[:10], desc="convert to features")):
         tmp_features = []
         for example in combined_example:
             guid = example.guid
@@ -220,6 +221,17 @@ def mkdir(path):
         os.makedirs(path)
 
 
+class TupleDataset(Dataset):
+    def __init__(self, data_tuple):
+        self.data_tuple = data_tuple
+
+    def __len__(self):
+        return len(self.data_tuple)
+
+    def __getitem__(self, idx):
+        item = self.data_tuple[idx]
+        return item
+
 def get_dataLoader(args, processor, tokenizer, phase=None):
     dataset_dict = {"train": args.train_set, "dev": args.dev_set, "std_test": args.std_test_set,
                     "complex_test": args.complex_test_set,
@@ -274,7 +286,9 @@ def get_dataLoader(args, processor, tokenizer, phase=None):
                  all_guid[idx][:prog_limit], all_label_ids[idx][:prog_limit], all_pred_label[idx][:prog_limit],
                  all_true_label[idx][:prog_limit]))
 
-    return dataloader, num_optimization_steps, examples
+
+
+    return DataLoader(TupleDataset(dataloader)), num_optimization_steps, examples
 
 
 def save_model(model_to_save, tokenizer):
@@ -298,6 +312,8 @@ def margin_max(logits, label_ids):
 def run_train(device, processor, tokenizer, model, writer, phase="train"):
     tr_dataloader, tr_num_steps, tr_examples = get_dataLoader(args, processor, tokenizer, phase=phase)
 
+    model, tr_dataloader = accelerator.prepare(model, tr_dataloader)
+
     model.train()
 
     param_optimizer = list(model.named_parameters())
@@ -308,6 +324,8 @@ def run_train(device, processor, tokenizer, model, writer, phase="train"):
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
     optimizer.zero_grad()
 
+    optimizer = accelerator.prepare(optimizer)
+
     global_step = 0
     best_acc = 0.0
     sum_loss = 0.0
@@ -315,21 +333,20 @@ def run_train(device, processor, tokenizer, model, writer, phase="train"):
 
     for ep in trange(args.num_train_epochs, desc="Training"):
         for step, batch in enumerate(tqdm(tr_dataloader)):
-            batch = tuple(t.to(device) for t in batch)
-            input_ids, input_mask, segment_ids, guid, label_ids, pred_label, true_label = batch
-            if 1 in label_ids.tolist() and input_ids.size()[0] != 1:
-                print("Training")
-                logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=None)
-                loss = margin_max(logits, label_ids)
-            else:
-                continue
+            input_ids, input_mask, segment_ids, guid_ids, label_ids, pred_label, true_label = batch
+
+            print(input_ids.shape, segment_ids.shape)
+
+            logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=None)
+            loss = margin_max(logits, label_ids)
+ 
 
             if n_gpu > 1:
                 loss = loss.mean()
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            loss.backward()
+            accelerator.backward(loss)
 
             sum_loss += loss.item()
 
@@ -375,12 +392,14 @@ def run_eval(device, processor, tokenizer, model, writer, global_step, save_deta
 
     dataloader, num_steps, examples = get_dataLoader(args, processor, tokenizer, phase=phase)
 
+    dataloader = accelerator.prepare(dataloader)
+
     eval_loss = 0.0
     num_steps = 0
     preds = []
 
     for step, batch in enumerate(tqdm(dataloader, desc=phase)):
-        batch = tuple(t.to(device) for t in batch)
+        batch = tuple(t for t in batch)
         input_ids, input_mask, segment_ids, guid_ids, label_ids, pred_label, true_label = batch
         assert len(input_ids) == len(input_mask) == len(segment_ids) == len(guid_ids) == len(label_ids) == len(
             pred_label) == len(true_label)
@@ -423,6 +442,8 @@ def evalSelectMostProb(device, processor, tokenizer, model, writer, global_step,
 
     dataloader, num_steps, examples = get_dataLoader(args, processor, tokenizer, phase=phase)
 
+    dataloader = accelerator.prepare(dataloader)
+
     eval_loss = 0.0
     num_steps = 0
     preds = []
@@ -431,13 +452,15 @@ def evalSelectMostProb(device, processor, tokenizer, model, writer, global_step,
     start = 0
 
     for step, batch in enumerate(tqdm(dataloader, desc=phase)):
-        batch = tuple(t.to(device) for t in batch)
+        batch = tuple(t for t in batch)
         input_ids, input_mask, segment_ids, guid_ids, label_ids, pred_label, true_label = batch
         assert len(input_ids) == len(input_mask) == len(segment_ids) == len(guid_ids) == len(label_ids) == len(
             pred_label) == len(true_label)
         num_steps += 1
 
         with torch.no_grad():
+            print(input_ids.shape, segment_ids.shape)
+
             logits = model(input_ids=input_ids, token_type_ids=segment_ids, attention_mask=input_mask, labels=None)
             max_index = np.argmax(torch.softmax(logits.view(-1), dim=0).tolist())
             pred_one = pred_label[max_index]
@@ -538,10 +561,7 @@ def main():
     logger.info('Model is loaded from %s' % load_dir)
 
     model = BertForSequenceClassification.from_pretrained(load_dir, cache_dir=cache_dir, num_labels=args.num_labels)
-    model.to(device)
-
-    if n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    model, tokenizer = accelerator.prepare(model, tokenizer)
 
     if args.do_train:
         logger.info("\n************ Start Training *************")
@@ -607,14 +627,16 @@ if __name__ == "__main__":
                              "bert-base-multilingual-uncased, bert-base-multilingual-cased, bert-base-chinese.")
     parser.add_argument("--do_lower_case", default=True, help="Set this flag if you are using an uncased model.")
     parser.add_argument("--max_seq_length", default=128)
-    parser.add_argument("--train_batch_size", default=16)
-    parser.add_argument("--eval_batch_size", default=16)
+    parser.add_argument("--train_batch_size", default=4)
+    parser.add_argument("--eval_batch_size", default=4)
     parser.add_argument("--learning_rate", default=2e-5, type=float, help="The initial learning rate for Adam.")
-    parser.add_argument("--num_train_epochs", default=5)
+    parser.add_argument("--num_train_epochs", default=20)
     parser.add_argument("--warmup_proportion", default=0.3, type=float, help="0.1 = 10%% of training.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4)
     parser.add_argument('--seed', type=int, default=42, help="random seed")
 
     args = parser.parse_args()
+
     main()
+
 
